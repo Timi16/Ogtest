@@ -56,4 +56,3 @@ async function queryOnce(broker, provider, prompt) {
     if (first)
         await queryOnce(broker, first, "Hello OG Compute!");
 })();
-//# sourceMappingURL=index.js.map

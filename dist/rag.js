@@ -82,4 +82,3 @@ function label(chunks) {
     const answer = await chat(b, CHAT_PROVIDER, answerPrompt);
     console.log(answer);
 })();
-//# sourceMappingURL=rag.js.map

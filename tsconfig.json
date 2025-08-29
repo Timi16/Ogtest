@@ -3,15 +3,13 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "rootDir": ".",              // <— where your .ts lives
-    "outDir": "dist",            // <— where JS should go
+    "rootDir": ".",
+    "outDir": "dist",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "verbatimModuleSyntax": false,
-    "types": ["node", "node-telegram-bot-api"],
-    "sourceMap": true
+    "types": ["node", "node-telegram-bot-api"]
   },
-  "include": ["**/*.ts"],
-  "exclude": ["dist", "node_modules"]
+  "include": ["**/*.ts"]
 }
