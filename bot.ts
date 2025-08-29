@@ -1,70 +1,87 @@
 import "dotenv/config";
 import * as ethers from "ethers";
 import TelegramBot from "node-telegram-bot-api";
+import { createZGComputeNetworkBroker } from "@0glabs/0g-serving-broker";
 import { pipeline } from "@xenova/transformers";
-// ⬇️ use the SDK's ESM build to avoid CJS error-handler issues
-import { createZGComputeNetworkBroker } from "@0glabs/0g-serving-broker/lib.esm/index.js";
 
 type Msg = { role: "system" | "user" | "assistant"; content: string };
 
-const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
-const RPC_URL = process.env.RPC_URL!;
-const PRIVATE_KEY = process.env.PRIVATE_KEY!;
-const CHAT_PROVIDER = process.env.CHAT_PROVIDER!;
+const BOT_TOKEN     = (process.env.BOT_TOKEN || "").trim();
+const RPC_URL       = process.env.RPC_URL!;
+const PRIVATE_KEY   = process.env.PRIVATE_KEY!;
+const CHAT_PROVIDER = process.env.CHAT_PROVIDER!; // provider address for chatbot service
 
-// light, fast greeting fallback (so you always greet even if classifier stalls)
-function isTrivialGreeting(t: string) {
-  return /^(hi|hello|hey|good (morning|afternoon|evening)|how (are|r) (you|u))/i.test(t);
-}
+// simple greeting fallback so convo feels responsive even if classifier is unsure
+const isTrivialGreeting = (t: string) =>
+  /^(hi|hello|hey|yo|gm|gn|good (morning|afternoon|evening)|how (are|r) (you|u))/i.test(t);
 
 async function makeBroker() {
-  const p = new ethers.JsonRpcProvider(RPC_URL);
-  const w = new ethers.Wallet(PRIVATE_KEY, p);
-  return createZGComputeNetworkBroker(w as any);
+  const provider = new ethers.JsonRpcProvider(RPC_URL);
+  const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
+  return createZGComputeNetworkBroker(wallet as any);
 }
 
-// prefer inference.* if present; fall back to root for older builds
 async function getMeta(b: any, provider: string) {
-  if (b.inference?.getServiceMetadata) {
-    return b.inference.getServiceMetadata(provider);
-  }
-  return b.getServiceMetadata(provider);
+  return b.inference?.getServiceMetadata
+    ? b.inference.getServiceMetadata(provider)
+    : b.getServiceMetadata(provider);
 }
 
-// Ensure a ledger exists & has at least `minA0GI` balance (A0GI = atomic unit, integer)
-async function ensureLedger(b: any, minA0GI = 100_000) {
+// ---------- Ledger helpers (OG units) ----------
+type LedgerInfo = { exists: boolean; raw: bigint; og: number };
+
+async function readLedger(b: any): Promise<LedgerInfo> {
   try {
     const acct = await b.ledger.getLedger();
-    const bal = BigInt(acct.totalbalance);          // already in A0GI
-    if (bal < BigInt(minA0GI)) {
-      const diff = Number(BigInt(minA0GI) - bal);   // small top-up → safe to Number
-      if (diff > 0) await b.ledger.depositFund(diff); // number in A0GI
-    }
-  } catch {
-    // no ledger yet → create with initial A0GI
-    await b.ledger.addLedger(minA0GI);              // number in A0GI
+    const raw  = ethers.getBigInt(acct.totalbalance);        // base units
+    const og   = parseFloat(ethers.formatEther(raw));         // display as OG
+    return { exists: true, raw, og };
+  } catch (err: any) {
+    const notExists =
+      err?.reason === "LedgerNotExists(address)" ||
+      String(err?.shortMessage || "").toLowerCase().includes("ledgernotexists");
+    if (notExists) return { exists: false, raw: 0n, og: 0 };
+    throw err;
   }
 }
 
-// One OpenAI-compatible chat call through 0G
+// Ensure a ledger exists and has at least `minOG` balance (number, in OG tokens)
+async function ensureLedgerMinOG(b: any, minOG = 0.02): Promise<number> {
+  const info = await readLedger(b);
+  if (!info.exists) {
+    await b.ledger.addLedger(minOG); // number, in OG
+    const after = await readLedger(b);
+    return after.og;
+  }
+  if (info.og < minOG) {
+    const topUp = minOG - info.og;   // number math in OG
+    await b.ledger.addLedger(topUp);  // top up (OG)
+    const after = await readLedger(b);
+    return after.og;
+  }
+  return info.og;
+}
+
+// ---------- 0G chat ----------
 async function ogChat(b: any, provider: string, messages: Msg[]) {
   const { endpoint, model } = await getMeta(b, provider);
 
-  // build single-use billing text (headers require the billed content)
-  const bill = messages.map(m => `${m.role}: ${m.content}`).join("\n").slice(0, 4000);
+  // acknowledge once; safe to call many times (no-op if already acked)
+  await b.inference.acknowledgeProviderSigner(provider);
 
-  // headers need: acknowledged provider + existing ledger (we do both on startup)
+  // billing text used to create signed headers
+  const bill = messages.map(m => `${m.role}: ${m.content}`).join("\n").slice(0, 4000);
   const headers = await b.inference.getRequestHeaders(provider, bill);
 
-  const res = await fetch(`${endpoint}/chat/completions`, {
+  const r = await fetch(`${endpoint}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
-    body: JSON.stringify({ model, messages })
+    body: JSON.stringify({ model, messages }),
   });
 
-  const j = await res.json();
+  const j = await r.json();
   const content = j?.choices?.[0]?.message?.content ?? "";
-  const chatId = j?.id ?? "";
+  const chatId  = j?.id ?? "";
   await b.inference.processResponse(provider, content, chatId);
   return content;
 }
@@ -73,57 +90,77 @@ async function main() {
   if (!/^\d+:[\w-]+$/.test(BOT_TOKEN)) throw new Error("BOT_TOKEN invalid");
 
   const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-  // clear webhook so polling works (ignore failures)
   try { await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook`); } catch {}
 
-  // warm everything once at startup
   const broker = await makeBroker();
-  await ensureLedger(broker, 100_000); // e.g., 100k A0GI buffer
-  await broker.inference.acknowledgeProviderSigner(CHAT_PROVIDER); // required once per provider
+  try {
+    const bal = await ensureLedgerMinOG(broker, 0.02); // require at least 0.02 OG
+    console.log("Ledger balance (OG):", bal.toFixed(6));
+  } catch (e) {
+    console.warn("Could not create/top-up ledger. You likely need testnet OG in the wallet.");
+  }
 
-  // tiny, local intent classifier (optional; keeps greetings nice)
-  const classifier = await pipeline(
-    "zero-shot-classification",
-    "Xenova/nli-deberta-v3-xsmall"
-  );
-  const CRYPTO_LABELS = [
-    "cryptocurrency","blockchain","defi","nfts","wallets",
-    "smart contracts","exchanges","privacy tee","0g"
-  ];
-  const INTENT_LABELS = ["greeting", ...CRYPTO_LABELS];
+  // tiny classifier for intent; keeps greetings nice
+  const classifier = await pipeline("zero-shot-classification", "Xenova/nli-deberta-v3-xsmall");
+  const CRYPTO = ["cryptocurrency","blockchain","defi","nfts","wallets","smart contracts","exchanges","privacy tee","0g"];
+  const LABELS = ["greeting", ...CRYPTO];
   const scoreOf = (out: any, label: string) => {
     const i = out.labels.findIndex((l: string) => l.toLowerCase() === label.toLowerCase());
     return i >= 0 ? Number(out.scores[i]) : 0;
-  };
+    };
+
+  // /balance command (shows current OG and hints if low)
+  bot.onText(/^\/balance$/, async (ctx: any) => {
+    const id = (ctx as any).chat?.id ?? (ctx as any).message?.chat?.id;
+    if (!id) return;
+    try {
+      const info = await readLedger(broker);
+      if (!info.exists) {
+        await bot.sendMessage(id, "No ledger yet. I’ll try to create it when you next ask a crypto question. Make sure your wallet has some OG on testnet.");
+        return;
+      }
+      const og = info.og;
+      await bot.sendMessage(id, `Ledger balance: ${og.toFixed(6)} OG`);
+    } catch (e) {
+      console.error(e);
+      await bot.sendMessage(id, "Couldn’t read balance right now.");
+    }
+  });
 
   bot.on("message", async (msg: any) => {
     const chatId = msg.chat?.id;
     const text = (msg.text ?? "").trim();
-    if (!text) return;
+    if (!text || text.startsWith("/")) return; // skip commands here
 
     try {
+      // greet fast
       if (isTrivialGreeting(text)) {
         await bot.sendMessage(chatId, "Hey! I’m Susana 👋 How can I help with crypto or 0G today?");
         return;
       }
 
-      const z = await classifier(text, INTENT_LABELS, {
-        multi_label: true,
-        hypothesis_template: "This text is about {}."
-      });
-      const greetScore = scoreOf(z, "greeting");
-      const cryptoScore = Math.max(...CRYPTO_LABELS.map(l => scoreOf(z, l)));
+      // ensure balance before paying for inference
+      try {
+        await ensureLedgerMinOG(broker, 0.02);
+      } catch {
+        await bot.sendMessage(chatId, "I need a bit of testnet OG in the wallet to operate. Please fund and try again.");
+        return;
+      }
 
-      if (greetScore >= 0.35 && cryptoScore < 0.45) {
+      // ML intent
+      const z = await classifier(text, LABELS, { multi_label: true, hypothesis_template: "This text is about {}." });
+      const greet  = scoreOf(z, "greeting");
+      const crypto = Math.max(...CRYPTO.map(l => scoreOf(z, l)));
+
+      if (greet >= 0.35 && crypto < 0.45) {
         await bot.sendMessage(chatId, "Hey! I’m Susana 👋 How can I help with crypto or 0G today?");
         return;
       }
 
-      if (cryptoScore >= 0.45) {
+      if (crypto >= 0.45) {
         const messages: Msg[] = [
           { role: "system", content: "You are Susana, a knowledgeable crypto/0G assistant. Be concise and accurate." },
-          { role: "user", content: text }
+          { role: "user",   content: text }
         ];
         const answer = await ogChat(broker, CHAT_PROVIDER, messages);
         await bot.sendMessage(chatId, answer || "No response.");
@@ -140,7 +177,12 @@ async function main() {
   bot.on("polling_error", (e: any) => console.error("[polling_error]", e));
   bot.onText(/^\/start$/, async (ctx: any) => {
     const id = (ctx as any).chat?.id ?? (ctx as any).message?.chat?.id;
-    if (id) await bot.sendMessage(id, "My name is Susana — your No.1 Crypto Bot. Ask me anything about crypto/0G.");
+    if (id) {
+      await bot.sendMessage(
+        id,
+        "My name is Susana — your No.1 Crypto Bot. Ask me anything about crypto/0G.\nUse /balance to check my 0G ledger."
+      );
+    }
   });
 
   console.log("Susana is running with long polling…");
