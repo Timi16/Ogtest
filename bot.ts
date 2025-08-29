@@ -1,7 +1,6 @@
 import "dotenv/config";
 import * as ethers from "ethers";
 import TelegramBot from "node-telegram-bot-api";
-import { createZGComputeNetworkBroker } from "@0glabs/0g-serving-broker";
 import { pipeline } from "@xenova/transformers";
 
 type Msg = { role: "system" | "user" | "assistant"; content: string };
@@ -15,39 +14,28 @@ const isTrivialGreeting = (t: string) =>
   /^(hi|hello|hey|yo|gm|gn|good (morning|afternoon|evening)|how (are|r) (you|u))/i.test(t);
 
 async function makeBroker() {
-  const provider = new ethers.JsonRpcProvider(RPC_URL);
-  const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+  const { createZGComputeNetworkBroker } = await import("@0glabs/0g-serving-broker");
+  const provider = new ethers.JsonRpcProvider(process.env.RPC_URL!);
+  const wallet   = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
   return createZGComputeNetworkBroker(wallet as any);
 }
 
 type LedgerInfo = { exists: boolean; raw: bigint; og: number };
 
 function toBigIntSafe(v: any): bigint {
-  try {
-    if (v === null || v === undefined) return 0n;
-    return ethers.getBigInt(v);
-  } catch {
-    return 0n;
-  }
+  try { if (v == null) return 0n; return ethers.getBigInt(v); } catch { return 0n; }
 }
 
 async function readLedger(b: any): Promise<LedgerInfo> {
   try {
     const acct = await b.ledger.getLedger();
-    const val =
-      acct?.totalbalance ??
-      acct?.totalBalance ??
-      acct?.balance ??
-      acct?.amount ??
-      0;
+    const val = acct?.totalbalance ?? acct?.totalBalance ?? acct?.balance ?? acct?.amount ?? 0;
     const raw = toBigIntSafe(val);
     const og = Number(ethers.formatEther(raw));
     return { exists: true, raw, og };
   } catch (err: any) {
     const msg = String(err?.reason || err?.shortMessage || err?.message || "").toLowerCase();
-    if (msg.includes("ledgernotexists") || msg.includes("call_exception")) {
-      return { exists: false, raw: 0n, og: 0 };
-    }
+    if (msg.includes("ledgernotexists") || msg.includes("call_exception")) return { exists: false, raw: 0n, og: 0 };
     return { exists: false, raw: 0n, og: 0 };
   }
 }
@@ -79,16 +67,45 @@ async function ogChat(b: any, provider: string, messages: Msg[]) {
   await b.inference.acknowledgeProviderSigner(provider);
   const bill = messages.map(m => `${m.role}: ${m.content}`).join("\n").slice(0, 4000);
   const headers = await b.inference.getRequestHeaders(provider, bill);
-  const r = await fetch(`${endpoint}/chat/completions`, {
+  const res = await fetch(`${endpoint}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify({ model, messages })
   });
-  const j = await r.json();
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} from provider. Body: ${txt.slice(0, 300)}`);
+  }
+  let j: any;
+  try {
+    j = await res.json();
+  } catch (e) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Non-JSON response from provider: ${txt.slice(0, 300)}`);
+  }
   const content = j?.choices?.[0]?.message?.content ?? "";
   const chatId = j?.id ?? "";
   await b.inference.processResponse(provider, content, chatId);
   return content;
+}
+
+async function diag(b: any, provider: string) {
+  try {
+    const meta = await getMeta(b, provider);
+    await b.inference.acknowledgeProviderSigner(provider);
+    const headers = await b.inference.getRequestHeaders(provider, "diag");
+    const res = await fetch(`${meta.endpoint}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({ model: meta.model, messages: [{ role: "user", content: "ping" }] })
+    });
+    const status = res.status;
+    let body = "";
+    try { body = await res.text(); } catch {}
+    return { ok: res.ok, status, endpoint: meta.endpoint, model: meta.model, body: body.slice(0, 300) };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e) };
+  }
 }
 
 async function main() {
@@ -100,7 +117,7 @@ async function main() {
   try {
     const bal = await ensureLedgerMinOG(broker, 0.02);
     console.log("Ledger balance (OG):", bal.toFixed(6));
-  } catch {
+  } catch (e) {
     console.warn("Could not create/top-up ledger. You likely need testnet OG in the wallet.");
   }
 
@@ -118,13 +135,33 @@ async function main() {
     try {
       const info = await readLedger(broker);
       if (!info.exists) {
-        await bot.sendMessage(id, "No ledger yet. Fund the wallet with testnet OG and ask a crypto question to initialize.");
+        await bot.sendMessage(id, "No ledger yet. Fund wallet with testnet OG and ask a crypto question to initialize.");
         return;
       }
       await bot.sendMessage(id, `Ledger balance: ${info.og.toFixed(6)} OG`);
-    } catch {
+    } catch (e) {
+      console.error("[/balance]", e);
       await bot.sendMessage(id, "Couldn’t read balance right now.");
     }
+  });
+
+  bot.onText(/^\/provider$/, async (ctx: any) => {
+    const id = (ctx as any).chat?.id ?? (ctx as any).message?.chat?.id;
+    if (!id) return;
+    try {
+      const m = await getMeta(broker, CHAT_PROVIDER);
+      await bot.sendMessage(id, `Provider: ${CHAT_PROVIDER}\nModel: ${m.model}\nEndpoint: ${m.endpoint}`);
+    } catch (e) {
+      console.error("[/provider]", e);
+      await bot.sendMessage(id, "Couldn’t read provider metadata.");
+    }
+  });
+
+  bot.onText(/^\/diag$/, async (ctx: any) => {
+    const id = (ctx as any).chat?.id ?? (ctx as any).message?.chat?.id;
+    if (!id) return;
+    const d = await diag(broker, CHAT_PROVIDER);
+    await bot.sendMessage(id, "Diag:\n" + JSON.stringify(d, null, 2));
   });
 
   bot.on("message", async (msg: any) => {
@@ -165,7 +202,8 @@ async function main() {
       }
 
       await bot.sendMessage(chatId, "I don’t have access to that information.");
-    } catch {
+    } catch (e) {
+      console.error("[message]", e);
       await bot.sendMessage(chatId, "Error reaching the crypto model. Try again.");
     }
   });
