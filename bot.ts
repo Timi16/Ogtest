@@ -1,11 +1,9 @@
 // bot.ts
 import "dotenv/config";
 import * as ethers from "ethers";
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
-
-const TelegramBot = require("node-telegram-bot-api");
-const { createZGComputeNetworkBroker } = require("@0glabs/0g-serving-broker");
+import TelegramBot from "node-telegram-bot-api";
+import { createZGComputeNetworkBroker } from "@0glabs/0g-serving-broker";
+import { pipeline } from "@xenova/transformers";
 
 type Msg = { role: "system" | "user" | "assistant"; content: string };
 
@@ -14,37 +12,31 @@ const RPC_URL = process.env.RPC_URL!;
 const PRIVATE_KEY = process.env.PRIVATE_KEY!;
 const CHAT_PROVIDER = process.env.CHAT_PROVIDER!;
 
-if (!/^\d+:[\w-]+$/.test(BOT_TOKEN)) throw new Error("BOT_TOKEN invalid");
-await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook`);
-
 async function makeBroker() {
   const p = new ethers.JsonRpcProvider(RPC_URL);
   const w = new ethers.Wallet(PRIVATE_KEY, p);
-  return createZGComputeNetworkBroker(w);
+  return createZGComputeNetworkBroker(w as any);
 }
 
 let zscPromise: Promise<any> | null = null;
 async function getClassifier() {
   if (!zscPromise) {
-    const { pipeline } = await import("@xenova/transformers");
-    // Small, fast NLI model; supports zero-shot classification
     zscPromise = pipeline("zero-shot-classification", "Xenova/nli-deberta-v3-xsmall");
   }
   return zscPromise!;
 }
 
 const CRYPTO_LABELS = [
-  "cryptocurrency", "blockchain", "defi", "nfts", "wallets",
-  "smart contracts", "exchanges", "privacy tee", "0g"
+  "cryptocurrency","blockchain","defi","nfts","wallets",
+  "smart contracts","exchanges","privacy tee","0g"
 ];
 const INTENT_LABELS = ["greeting", ...CRYPTO_LABELS];
 
-function scoreOf(output: any, label: string) {
-  const i = output.labels.findIndex((l: string) => l.toLowerCase() === label.toLowerCase());
-  return i >= 0 ? Number(output.scores[i]) : 0;
-}
+const scoreOf = (out: any, label: string) => {
+  const i = out.labels.findIndex((l: string) => l.toLowerCase() === label.toLowerCase());
+  return i >= 0 ? Number(out.scores[i]) : 0;
+};
 
-// ---- 0G chat call (OpenAI-compatible path) ----
 async function getMeta(b: any, provider: string) {
   return b.getServiceMetadata ? b.getServiceMetadata(provider) : b.inference.getServiceMetadata(provider);
 }
@@ -65,60 +57,62 @@ async function ogChat(b: any, provider: string, messages: Msg[]) {
   return content;
 }
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-let brokerPromise: Promise<any> | null = null;
+async function main() {
+  if (!/^\d+:[\w-]+$/.test(BOT_TOKEN)) throw new Error("BOT_TOKEN invalid");
 
-bot.on("message", async (msg: any) => {
-  const chatId = msg.chat?.id;
-  const text = (msg.text ?? "").trim();
-  if (!text) return;
+  // ensure no webhook so polling works
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook`);
 
-  try {
-    brokerPromise = brokerPromise || makeBroker();
-    const broker = await brokerPromise;
+  const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+  let brokerPromise: Promise<any> | null = null;
 
-    // Classify intent (no manual rules)
-    const classifier = await getClassifier();
-    const z = await classifier(text, INTENT_LABELS, {
-      multi_label: true,
-      hypothesis_template: "This text is about {}."
-    });
+  bot.on("message", async (msg: any) => {
+    const chatId = msg.chat?.id;
+    const text = (msg.text ?? "").trim();
+    if (!text) return;
 
-    const greetScore = scoreOf(z, "greeting");
-    const cryptoScore = Math.max(...CRYPTO_LABELS.map(l => scoreOf(z, l)));
+    try {
+      brokerPromise = brokerPromise || makeBroker();
+      const broker = await brokerPromise;
 
-    if (greetScore >= 0.60 && cryptoScore < 0.50) {
-      await bot.sendMessage(chatId, "Hey! I’m Susana 👋 How can I help with crypto or 0G today?");
-      return;
+      const classifier = await getClassifier();
+      const z = await classifier(text, INTENT_LABELS, {
+        multi_label: true,
+        hypothesis_template: "This text is about {}."
+      });
+
+      const greetScore = scoreOf(z, "greeting");
+      const cryptoScore = Math.max(...CRYPTO_LABELS.map(l => scoreOf(z, l)));
+
+      if (greetScore >= 0.60 && cryptoScore < 0.50) {
+        await bot.sendMessage(chatId, "Hey! I’m Susana 👋 How can I help with crypto or 0G today?");
+        return;
+      }
+
+      if (cryptoScore >= 0.50) {
+        const messages: Msg[] = [
+          { role: "system", content: "You are Susana, a knowledgeable crypto/0G assistant. Be concise and accurate." },
+          { role: "user", content: text }
+        ];
+        const answer = await ogChat(broker, CHAT_PROVIDER, messages);
+        await bot.sendMessage(chatId, answer || "No response.");
+        return;
+      }
+
+      await bot.sendMessage(chatId, "I don’t have access to that information.");
+    } catch (e) {
+      console.error(e);
+      await bot.sendMessage(chatId, "Error reaching the crypto model. Try again.");
     }
+  });
 
-    if (cryptoScore >= 0.50) {
-      const messages: Msg[] = [
-        { role: "system", content: "You are Susana, a knowledgeable crypto/0G assistant. Be concise and accurate." },
-        { role: "user", content: text }
-      ];
-      const answer = await ogChat(broker, CHAT_PROVIDER, messages);
-      await bot.sendMessage(chatId, answer || "No response.");
-      return;
-    }
+  bot.on("polling_error", (e: any) => console.error("[polling_error]", e));
+  bot.onText(/^\/start$/, async (ctx: any) => {
+    const chatId = (ctx as any).chat?.id ?? (ctx as any).message?.chat?.id;
+    if (chatId) await bot.sendMessage(chatId, "My name is Susana — your No.1 Crypto Bot. Ask me anything about crypto/0G.");
+  });
 
-    await bot.sendMessage(chatId, "I don’t have access to that information.");
-  } catch (e) {
-    console.error(e);
-    await bot.sendMessage(chatId, "Error reaching the crypto model. Try again.");
-  }
-});
+  console.log("Susana is running with long polling…");
+}
 
-bot.on("polling_error", (e: any) => console.error("[polling_error]", e));
-
-bot.onText(/^\/start$/, async (ctx: any) => {
-  const chatId = (ctx as any).chat?.id ?? (ctx as any).message?.chat?.id;
-  if (chatId) {
-    await bot.sendMessage(
-      chatId,
-      "My name is Susana — your No.1 Crypto Bot. Ask me anything about crypto/0G."
-    );
-  }
-});
-
-console.log("Susana is running with long polling…");
+void main();
