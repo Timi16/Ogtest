@@ -1,4 +1,3 @@
-// bot.ts
 import "dotenv/config";
 import * as ethers from "ethers";
 import TelegramBot from "node-telegram-bot-api";
