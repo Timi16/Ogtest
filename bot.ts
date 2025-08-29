@@ -1,10 +1,10 @@
 import "dotenv/config";
 import * as ethers from "ethers";
 import { createRequire } from "module";
-import { createZGComputeNetworkBroker } from "@0glabs/0g-serving-broker";
 
 const require = createRequire(import.meta.url);
 const TelegramBot = require("node-telegram-bot-api");
+const { createZGComputeNetworkBroker } = require("@0glabs/0g-serving-broker");
 
 type Msg = { role: "system" | "user" | "assistant"; content: string };
 
@@ -13,19 +13,16 @@ const RPC_URL = process.env.RPC_URL!;
 const PRIVATE_KEY = process.env.PRIVATE_KEY!;
 const CHAT_PROVIDER = process.env.CHAT_PROVIDER!;
 
-// ---- 0G helpers ----
 async function makeBroker() {
   const p = new ethers.JsonRpcProvider(RPC_URL);
   const w = new ethers.Wallet(PRIVATE_KEY, p);
-  return createZGComputeNetworkBroker(w as any);
+  return createZGComputeNetworkBroker(w);
 }
-async function ensureLedger(b: any, amount = 0.05) {
-  try { await b.ledger.getLedger(); } catch { await b.ledger.addLedger(amount); }
-}
+
 async function getMeta(b: any, provider: string) {
-  return (b.getServiceMetadata ? await b.getServiceMetadata(provider)
-                               : await b.inference.getServiceMetadata(provider));
+  return b.getServiceMetadata ? b.getServiceMetadata(provider) : b.inference.getServiceMetadata(provider);
 }
+
 async function ogChat(b: any, provider: string, messages: Msg[]) {
   const { endpoint, model } = await getMeta(b, provider);
   await b.inference.acknowledgeProviderSigner(provider);
@@ -54,38 +51,25 @@ const cryptoRegex = new RegExp(
 );
 const isCrypto = (t?: string) => !!t && cryptoRegex.test(t);
 
-// ---- bot (long-polling) ----
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: { // long-polling; library handles offset/loop
-    params: { timeout: 30 } // seconds; Telegram holds the connection open
-  }
-});
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 let brokerPromise: Promise<any> | null = null;
 
 bot.on("message", async (msg: any) => {
   const chatId = msg.chat?.id;
   const text = (msg.text ?? "").trim();
-
   if (!text) return;
   if (!isCrypto(text)) {
     await bot.sendMessage(chatId, "I don’t have access to that information. Ask me something crypto.");
     return;
   }
-
   try {
-    brokerPromise = brokerPromise || (async () => {
-      const b = await makeBroker();
-      await ensureLedger(b, 0.05);
-      return b;
-    })();
+    brokerPromise = brokerPromise || makeBroker();
     const broker = await brokerPromise;
-
     const messages: Msg[] = [
       { role: "system", content: "You are a concise, crypto-native assistant. Ignore non-crypto topics." },
       { role: "user", content: text }
     ];
-
     const answer = await ogChat(broker, CHAT_PROVIDER, messages);
     await bot.sendMessage(chatId, answer || "No response.");
   } catch (e) {
