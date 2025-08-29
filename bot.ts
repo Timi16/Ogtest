@@ -9,9 +9,8 @@ type Msg = { role: "system" | "user" | "assistant"; content: string };
 const BOT_TOKEN     = (process.env.BOT_TOKEN || "").trim();
 const RPC_URL       = process.env.RPC_URL!;
 const PRIVATE_KEY   = process.env.PRIVATE_KEY!;
-const CHAT_PROVIDER = process.env.CHAT_PROVIDER!; // provider address for chatbot service
+const CHAT_PROVIDER = process.env.CHAT_PROVIDER!;
 
-// simple greeting fallback so convo feels responsive even if classifier is unsure
 const isTrivialGreeting = (t: string) =>
   /^(hi|hello|hey|yo|gm|gn|good (morning|afternoon|evening)|how (are|r) (you|u))/i.test(t);
 
@@ -27,7 +26,6 @@ async function getMeta(b: any, provider: string) {
     : b.getServiceMetadata(provider);
 }
 
-// ---------- Ledger helpers (OG units) ----------
 type LedgerInfo = { exists: boolean; raw: bigint; og: number };
 
 async function readLedger(b: any): Promise<LedgerInfo> {
