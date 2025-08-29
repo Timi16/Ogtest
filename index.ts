@@ -2,63 +2,60 @@ import "dotenv/config";
 import * as ethers from "ethers";
 import { createZGComputeNetworkBroker } from "@0glabs/0g-serving-broker";
 
-async function setupBroker() {
+type Broker = any;
+
+async function setup(): Promise<Broker> {
   const provider = new ethers.JsonRpcProvider(process.env.RPC_URL!);
   const wallet = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
   const broker = await createZGComputeNetworkBroker(wallet as any);
-  console.log(" Broker:", wallet.address);
+  console.log("Broker address:", wallet.address);
   return broker;
 }
 
-async function ensureAccountAndFund(broker: any, amount = "0.10") {
-  let acct;
+async function ensureLedger(broker: Broker, initialAmount = 0.1) {
   try {
-    acct = await broker.ledger.getLedger();
+    await broker.ledger.getLedger();
   } catch {
-    console.log(" Creating ledger with", amount, "OG…");
-    await broker.ledger.addLedger(amount);
-    acct = await broker.ledger.getLedger();
+    await broker.ledger.addLedger(Number(initialAmount));
   }
-
-  const bal = ethers.getBigInt(acct.totalbalance);
-  const need = ethers.parseEther(amount);
-  if (bal < need) {
-    console.log("➕ Funding ledger with", amount, "OG…");
-    await broker.ledger.addLedger(amount);
-    acct = await broker.ledger.getLedger();
-  }
-
-  console.log("Balance:", ethers.formatEther(acct.totalbalance), "OG");
 }
 
-async function listServices(broker: any) {
-  const services = await broker.listServices();
-  const clean = (services || []).map((s: any, i: number) => ({
+async function listServices(broker: Broker) {
+  const services = await broker.inference.listService();
+  const rows = (services ?? []).map((s: any, i: number) => ({
     i,
-    address: s?.address || s?.provider || "unknown",
-    model: s?.model || s?.name || "unknown",
-    price: s?.price || s?.cost || "n/a",
+    provider: s?.provider,
+    serviceType: s?.serviceType,
+    url: s?.url,
+    model: s?.model,
+    inputPrice: s?.inputPrice?.toString?.(),
+    outputPrice: s?.outputPrice?.toString?.(),
   }));
-  if (clean.length) console.table(clean);
-  else console.log(" No services found.");
+  if (rows.length) console.table(rows);
+  else console.log("No services found.");
   return services;
 }
 
-async function queryProvider(broker: any, addr: string) {
-  console.log(" Querying:", addr);
-  const out = await broker.query(addr, "Hello OG Compute!");
-  console.log(" Output:", out);
+async function queryOnce(broker: Broker, provider: string, prompt: string) {
+  const { endpoint, model } = await broker.inference.getServiceMetadata(provider);
+  await broker.inference.acknowledgeProviderSigner(provider);
+  const headers = await broker.inference.getRequestHeaders(provider, prompt);
+  const res = await fetch(`${endpoint}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }] }),
+  });
+  const data = await res.json();
+  const content = data?.choices?.[0]?.message?.content ?? "";
+  const chatId = data?.id ?? "";
+  await broker.inference.processResponse(provider, content, chatId);
+  console.log(content);
 }
 
 (async () => {
-  try {
-    const broker = await setupBroker();
-    await ensureAccountAndFund(broker, "0.10");
-    const services = await listServices(broker);
-    const first =
-      services?.[0]?.address || services?.[0]?.provider || undefined;
-    if (first) await queryProvider(broker, first);
-  } catch (e) {
-    console.error("", e);
-  }
+  const broker = await setup();
+  await ensureLedger(broker, 0.1);
+  const services = await listServices(broker);
+  const first = services?.[0]?.provider;
+  if (first) await queryOnce(broker, first, "Hello OG Compute!");
 })();
