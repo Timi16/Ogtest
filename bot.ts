@@ -1,4 +1,3 @@
-// bot.ts
 import "dotenv/config";
 import * as ethers from "ethers";
 import { createRequire } from "module";
